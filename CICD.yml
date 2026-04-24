@@ -1,0 +1,159 @@
+trigger:
+  branches:
+    include:
+      - main
+
+variables:
+  LIQUIBASE_VERSION: '4.23'
+  CHANGELOG_FILE: 'changelog/db.changelog.xml'
+
+stages:
+- stage: Validate
+  jobs:
+    - job: ValidateJob
+      pool:
+        vmImage: 'ubuntu-latest'
+      steps:
+        - checkout: self
+
+        - script: |
+            wget https://github.com/liquibase/liquibase/releases/download/v$(LIQUIBASE_VERSION)/liquibase-$(LIQUIBASE_VERSION).tar.gz
+            tar -xzf liquibase-$(LIQUIBASE_VERSION).tar.gz
+            sudo ln -s $(pwd)/liquibase/liquibase /usr/local/bin/liquibase
+          displayName: "Install Liquibase"
+
+        - script: liquibase validate --changeLogFile=$(CHANGELOG_FILE)
+          displayName: "Validate"
+
+        - script: liquibase updateSQL --changeLogFile=$(CHANGELOG_FILE)
+          displayName: "Dry Run"
+
+- stage: Deploy_Dev
+  dependsOn: Validate
+  jobs:
+    - deployment: DevDeploy
+      environment: dev
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+              - checkout: self
+
+              - task: AzureKeyVault@2
+                inputs:
+                  azureSubscription: 'azure-service-connection'
+                  KeyVaultName: 'kv-dev'
+                  SecretsFilter: 'db-username,db-password,db-url'
+                  RunAsPreJob: true
+
+              - script: |
+                  liquibase update \
+                    --url=$(db-url) \
+                    --username=$(db-username) \
+                    --password=$(db-password) \
+                    --changeLogFile=$(CHANGELOG_FILE)
+                displayName: "Deploy to DEV"
+
+              # Smoke Test
+              - script: |
+                  echo "Running smoke tests on DEV..."
+                  # Example check
+                  # sqlcmd -Q "SELECT COUNT(*) FROM users"
+                displayName: "Smoke Test - DEV"
+
+- stage: Deploy_QA
+  dependsOn: Deploy_Dev
+  jobs:
+    - deployment: QADeploy
+      environment: qa
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+              - checkout: self
+
+              - task: AzureKeyVault@2
+                inputs:
+                  azureSubscription: 'azure-service-connection'
+                  KeyVaultName: 'kv-qa'
+                  SecretsFilter: 'db-username,db-password,db-url'
+                  RunAsPreJob: true
+
+              - script: |
+                  liquibase update \
+                    --url=$(db-url) \
+                    --username=$(db-username) \
+                    --password=$(db-password) \
+                    --changeLogFile=$(CHANGELOG_FILE)
+                displayName: "Deploy to QA"
+
+              # Smoke Test
+              - script: |
+                  echo "Running smoke tests on QA..."
+                displayName: "Smoke Test - QA"
+
+- stage: Deploy_Prod
+  dependsOn: Deploy_QA
+  jobs:
+    - deployment: ProdDeploy
+      environment: prod   # Approval required
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+              - checkout: self
+
+              - task: AzureKeyVault@2
+                inputs:
+                  azureSubscription: 'azure-service-connection'
+                  KeyVaultName: 'kv-prod'
+                  SecretsFilter: 'db-username,db-password,db-url'
+                  RunAsPreJob: true
+
+              # PRE-DEPLOYMENT BACKUP
+              - script: |
+                  echo "Taking database backup..."
+                  # Example for Azure SQL
+                  # sqlcmd -Q "BACKUP DATABASE [db] TO DISK='backup.bak'"
+                displayName: "Pre-Deployment Backup"
+
+              - script: |
+                  liquibase update \
+                    --url=$(db-url) \
+                    --username=$(db-username) \
+                    --password=$(db-password) \
+                    --changeLogFile=$(CHANGELOG_FILE)
+                displayName: "Deploy to PROD"
+
+              # Smoke Test
+              - script: |
+                  echo "Running smoke tests on PROD..."
+                displayName: "Smoke Test - PROD"
+
+- stage: Rollback_Prod
+  dependsOn: Deploy_Prod
+  condition: failed()
+  jobs:
+    - deployment: RollbackJob
+      environment: prod
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+              - checkout: self
+
+              - task: AzureKeyVault@2
+                inputs:
+                  azureSubscription: 'azure-service-connection'
+                  KeyVaultName: 'kv-prod'
+                  SecretsFilter: 'db-username,db-password,db-url'
+                  RunAsPreJob: true
+
+              - script: |
+                  echo "Rolling back last change..."
+                  liquibase rollbackCount 1 \
+                    --url=$(db-url) \
+                    --username=$(db-username) \
+                    --password=$(db-password) \
+                    --changeLogFile=$(CHANGELOG_FILE)
+                displayName: "Rollback Change"
